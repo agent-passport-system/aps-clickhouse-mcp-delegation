@@ -12,8 +12,8 @@ enforces. This layer adds two things the static mapping cannot:
 1. A narrowed, time-bound grant. An agent acting for a user is not the user.
    Instead of handing the agent the user's full RBAC identity, we resolve an
    APS delegation: a signed grant scoped to specific tools, with an expiry,
-   that the agent cannot exceed. The ClickHouse settings we return are derived
-   from that delegation, not from the user's full account.
+   that the agent cannot exceed. The ClickHouse user the agent runs as is
+   derived from that delegation, not from the user's full account.
 
 2. A signed receipt per tool call. query_log records what ran, attributed to
    whoever connected. A policy receipt records what was authorized: who

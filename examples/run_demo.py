@@ -20,7 +20,7 @@ CLICKHOUSE_PASSWORD), defaults to http://localhost:8123.
 """
 
 from __future__ import annotations
-import os, sys, json
+import os, sys, json, secrets
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import agent_passport as ap
@@ -32,7 +32,7 @@ from delegation_resolver import DelegationStore
 from middleware import decide, clickhouse_overrides_from_delegation
 
 
-def ch_client():
+def ch_client(username=None, password=None):
     url = os.environ.get("CLICKHOUSE_URL", "http://localhost:8123")
     secure = url.startswith("https")
     rest = url.split("://", 1)[1]
@@ -41,8 +41,8 @@ def ch_client():
     try:
         return clickhouse_connect.get_client(
             host=host, port=port, secure=secure,
-            username=os.environ.get("CLICKHOUSE_USER", "default"),
-            password=os.environ.get("CLICKHOUSE_PASSWORD", ""),
+            username=username or os.environ.get("CLICKHOUSE_USER", "default"),
+            password=password if password is not None else os.environ.get("CLICKHOUSE_PASSWORD", ""),
         )
     except DatabaseError as e:
         msg = str(e)
@@ -74,7 +74,26 @@ def setup_schema(client):
     """)
 
 
-def make_boundary_receipt(tool, result, detail, root, evaluator_did, evaluator_priv):
+READ_ONLY_USER = "aps_agent_ro"
+
+
+def setup_read_only_user(client) -> str:
+    """
+    Create the ClickHouse user a read delegation runs as. The server keeps it
+    read-only: readonly=1 is fixed (READONLY) so no query can lower it, and it
+    holds SELECT only. Needs a ClickHouse user with access management.
+    """
+    password = secrets.token_urlsafe(24)
+    client.command(f"DROP USER IF EXISTS {READ_ONLY_USER}")
+    client.command(
+        f"CREATE USER {READ_ONLY_USER} IDENTIFIED WITH sha256_password BY '{password}' "
+        "SETTINGS readonly = 1 READONLY"
+    )
+    client.command(f"GRANT SELECT ON *.* TO {READ_ONLY_USER}")
+    return password
+
+
+def make_boundary_receipt(tool, action_id, result, detail, root, evaluator_did, evaluator_priv):
     scope_claim = ScopeOfClaim(
         asserts=f"tool '{tool}' was checked against the agent's delegation scope",
         does_not_assert=[
@@ -87,7 +106,7 @@ def make_boundary_receipt(tool, result, detail, root, evaluator_did, evaluator_p
     )
     return ap.create_authority_boundary_receipt(
         scope_of_claim=scope_claim,
-        action_id=f"act_{tool}",
+        action_id=action_id,
         evaluator_did=evaluator_did,
         delegation_chain_root=root,
         result=result,
@@ -123,28 +142,38 @@ def main():
     print(f"[setup] agent {agent_id} holds delegation {root}")
     print(f"[setup] scope={delegation['scope']} (read only), expires in 1 day\n")
 
-    # The same delegation derives the ClickHouse session settings the agent
-    # would run its own queries under. A read-only delegation narrows the
-    # session to readonly=1, so the database enforces the same limit the
-    # receipt records.
-    agent_overrides = clickhouse_overrides_from_delegation(delegation, base_user="default")
-    print(f"[derive] agent ClickHouse session from delegation: {agent_overrides.get('settings', {})}\n")
-
     client = ch_client()
     setup_schema(client)
+    client.command("CREATE TABLE IF NOT EXISTS aps_demo_events (n Int32) ENGINE = Memory")
+    ro_password = setup_read_only_user(client)
 
-    # A dispatch sequence: three read tools the agent may use, then a
-    # destructive tool it was never delegated.
+    # The delegation decides which ClickHouse user the agent's calls run as.
+    # A read-only delegation runs as the server-enforced read-only user.
+    overrides = clickhouse_overrides_from_delegation(
+        delegation, read_only_user=READ_ONLY_USER, full_user="default"
+    )
+    agent_client = ch_client(username=overrides["username"], password=ro_password)
+    print(f"[derive] agent calls run as ClickHouse user '{overrides['username']}' (read only on the server)\n")
+
+    # A simulated dispatch with the mcp-clickhouse v0.7.0 tool names. The
+    # calls are not sent through mcp-clickhouse. Each permitted call is run
+    # as the agent's ClickHouse user, the SQL that tool would send.
+    # The last field is the outcome the demo requires. Any other outcome
+    # makes the demo exit 1.
     calls = [
-        ("list_databases", None),
-        ("list_tables", None),
-        ("run_select_query", "SELECT count() FROM system.tables"),
-        ("drop_table", "DROP TABLE important_data"),
+        ("list_databases", "SHOW DATABASES", "ran"),
+        ("list_tables", "SHOW TABLES", "ran"),
+        ("run_query", "SELECT count() FROM system.tables", "ran"),
+        ("run_query", "DROP TABLE important_data", "denied"),
+        # Starts with a read keyword, so the policy labels it read and
+        # permits it. The read-only user is what stops the write.
+        ("run_query", "WITH 1 AS x INSERT INTO aps_demo_events VALUES (1)", "refused_by_clickhouse"),
     ]
+    failures = []
 
-    print("[dispatch] agent runs four MCP tool calls:")
-    for tool, query in calls:
-        permitted, required, reason = decide(delegation, tool)
+    print(f"[dispatch] agent runs {len(calls)} MCP tool calls:")
+    for i, (tool, query, want) in enumerate(calls, start=1):
+        permitted, required, reason = decide(delegation, tool, query)
         result = "inside" if permitted else "outside"
         detail = (
             f"authorized: {required} in delegation scope"
@@ -152,7 +181,7 @@ def main():
             else f"denied: {required} not in {delegation['scope']} ({reason})"
         )
         receipt = make_boundary_receipt(
-            tool, result, detail, root, evaluator_did, evaluator["privateKey"]
+            tool, f"act_{i}_{tool}", result, detail, root, evaluator_did, evaluator["privateKey"]
         )
         rc = receipt.to_canonical_dict()
         client.insert(
@@ -173,9 +202,22 @@ def main():
             ],
         )
         mark = "INSIDE " if permitted else "OUTSIDE"
-        print(f"  {mark} {tool:18s} receipt={receipt.receipt_id[:20]}")
+        print(f"  {mark} {tool:15s} {required:17s} receipt={receipt.receipt_id[:20]}")
+        print(f"          sql: {query}")
         if not permitted:
+            got = "denied"
             print(f"          not run: {detail}")
+        else:
+            try:
+                agent_client.command(query)
+                got = "ran"
+                print("          ran as the agent's user")
+            except DatabaseError as e:
+                got = "refused_by_clickhouse"
+                code = str(e).split("DB::Exception:")[-1].strip().split(".")[0]
+                print(f"          refused by ClickHouse: {code}")
+        if got != want:
+            failures.append(f"call {i} ({tool}: {query}) expected {want}, got {got}")
 
     # Re-verify every receipt straight out of ClickHouse.
     print("\n[verify] reading receipts back from ClickHouse and checking signatures:")
@@ -210,7 +252,15 @@ def main():
         ok += 1 if valid else 0
         print(f"  {'PASS' if valid else 'FAIL'} {tool:18s} result={result}")
     print(f"\n[verify] {ok}/{len(rows)} receipts verified against the store")
-    print("[done] every tool call left a signed boundary receipt; the denied call is as auditable as the permitted ones")
+    if len(rows) != len(calls):
+        failures.append(f"expected {len(calls)} receipts in the store, found {len(rows)}")
+    if ok != len(rows):
+        failures.append(f"{len(rows) - ok} receipts failed verification")
+    if failures:
+        for f in failures:
+            print(f"[FAIL] {f}")
+        raise SystemExit(1)
+    print("[done] every call had its required outcome, and every call left a verified signed receipt")
 
 
 if __name__ == "__main__":

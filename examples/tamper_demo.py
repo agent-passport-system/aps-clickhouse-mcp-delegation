@@ -66,12 +66,16 @@ def main():
     ).result_rows
     if not rows:
         print("No receipts found. Run examples/run_demo.py first.")
-        return
+        raise SystemExit(1)
     rid, tool, result, rjson = rows[0]
     rc = json.loads(rjson)
 
     print(f"[target] receipt {rid[:20]} for tool '{tool}', result '{result}'")
-    print("[before] verifies:", ap.verify_authority_boundary_receipt(rebuild(rc))["valid"])
+    before = ap.verify_authority_boundary_receipt(rebuild(rc))["valid"]
+    print("[before] verifies:", before)
+    if not before:
+        print("[FAIL] the untouched receipt does not verify")
+        raise SystemExit(1)
 
     # Flip the denied call to look authorized, the way an attacker would.
     print("\n[tamper] rewriting result 'outside' -> 'inside' inside ClickHouse")
@@ -98,6 +102,9 @@ def main():
     verdict = ap.verify_authority_boundary_receipt(rebuild(stored))
     print("[after]  stored row now says result:", stored["result"])
     print("[after]  verifies:", verdict["valid"], "| reason:", verdict.get("reason"))
+    if stored["result"] != "inside" or verdict["valid"]:
+        print("[FAIL] the tampered row was not rewritten, or it still verifies")
+        raise SystemExit(1)
     print("\n[done] the altered row fails verification. The signature is over the")
     print("       original decision, so changing the stored result breaks it.")
 
